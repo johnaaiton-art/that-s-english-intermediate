@@ -23,7 +23,10 @@ logging.basicConfig(level=logging.INFO)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-
+# After loading env vars
+print(f"TELEGRAM_BOT_TOKEN: '{TELEGRAM_BOT_TOKEN}'")
+print(f"DEEPSEEK_API_KEY: '{DEEPSEEK_API_KEY}'")
+print(f"GOOGLE_CREDENTIALS_JSON: '{GOOGLE_CREDENTIALS_JSON[:100] if GOOGLE_CREDENTIALS_JSON else 'None'}'")
 # Validate required environment variables
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables")
