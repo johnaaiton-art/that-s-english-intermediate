@@ -27,6 +27,14 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 print(f"TELEGRAM_BOT_TOKEN: '{TELEGRAM_BOT_TOKEN}'")
 print(f"DEEPSEEK_API_KEY: '{DEEPSEEK_API_KEY}'")
 print(f"GOOGLE_CREDENTIALS_JSON: '{GOOGLE_CREDENTIALS_JSON[:100] if GOOGLE_CREDENTIALS_JSON else 'None'}'")
+# ===== DEBUG ENV =====
+print("=== ENVIRONMENT DEBUG ===")
+print(f"TELEGRAM_BOT_TOKEN: '{TELEGRAM_BOT_TOKEN}'")
+print(f"DEEPSEEK_API_KEY: '{DEEPSEEK_API_KEY}'")
+print(f"GOOGLE_CREDENTIALS_JSON: '{GOOGLE_CREDENTIALS_JSON}'")
+print(f"OS ENVS: {list(os.environ.keys())}")
+print("=========================")
+# ===== END DEBUG =====
 # Validate required environment variables
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables")
