@@ -4,6 +4,7 @@ import hashlib
 import re
 import zipfile
 import time
+import random
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update
@@ -16,26 +17,14 @@ from io import BytesIO
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import logging
 
-# Configure logging here
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 
-# Load environment variables (safe for GitHub / Railway)
+# Load environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
-# After loading env vars
-print(f"TELEGRAM_BOT_TOKEN: '{TELEGRAM_BOT_TOKEN}'")
-print(f"DEEPSEEK_API_KEY: '{DEEPSEEK_API_KEY}'")
-print(f"GOOGLE_CREDENTIALS_JSON: '{GOOGLE_CREDENTIALS_JSON[:100] if GOOGLE_CREDENTIALS_JSON else 'None'}'")
-# ===== DEBUG ENV =====
-print("=== ENVIRONMENT DEBUG ===")
-print(f"TELEGRAM_BOT_TOKEN: '{TELEGRAM_BOT_TOKEN}'")
-print(f"DEEPSEEK_API_KEY: '{DEEPSEEK_API_KEY}'")
-print(f"GOOGLE_CREDENTIALS_JSON: '{GOOGLE_CREDENTIALS_JSON}'")
-print(f"OS ENVS: {list(os.environ.keys())}")
-print("=========================")
-# ===== END DEBUG =====
-# Validate required environment variables
+
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables")
 if not DEEPSEEK_API_KEY:
@@ -43,31 +32,28 @@ if not DEEPSEEK_API_KEY:
 if not GOOGLE_CREDENTIALS_JSON:
     raise ValueError("Missing GOOGLE_CREDENTIALS_JSON in environment variables")
 
-# Configuration
 class Config:
     MAX_TOPIC_LENGTH = 100
-    MAX_VOCAB_ITEMS = 15
+    MAX_VOCAB_ITEMS = 12
     TTS_TIMEOUT = 30
     API_RETRY_ATTEMPTS = 3
     RATE_LIMIT_REQUESTS = 5
-    RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
-    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB (Telegram limit)
+    RATE_LIMIT_WINDOW = 3600
+    MAX_FILE_SIZE = 50 * 1024 * 1024
 
 config = Config()
 
-# Initialize DeepSeek client
 deepseek_client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
 )
 
-# Rate Limiter
 class RateLimiter:
     def __init__(self, max_requests=5, window=3600):
         self.requests = defaultdict(list)
         self.max_requests = max_requests
         self.window = window
-
+    
     def is_allowed(self, user_id):
         now = time.time()
         user_requests = self.requests[user_id]
@@ -76,7 +62,7 @@ class RateLimiter:
             return False
         user_requests.append(now)
         return True
-
+    
     def get_reset_time(self, user_id):
         if not self.requests[user_id]:
             return 0
@@ -90,16 +76,12 @@ rate_limiter = RateLimiter(
 )
 
 def get_google_tts_client():
-    """Initialize Google TTS client with credentials from environment variable"""
-    if GOOGLE_CREDENTIALS_JSON:
-        credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        credentials = service_account.Credentials.from_service_account_info(
-            credentials_dict,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-        return texttospeech.TextToSpeechClient(credentials=credentials)
-    else:
-        return texttospeech.TextToSpeechClient()
+    credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    credentials = service_account.Credentials.from_service_account_info(
+        credentials_dict,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    return texttospeech.TextToSpeechClient(credentials=credentials)
 
 def validate_topic(topic):
     topic = re.sub(r'\s+', ' ', topic.strip())
@@ -153,23 +135,20 @@ def generate_tts_english_sync(text, voice_name):
         for sentence in sentences:
             synthesis_input = texttospeech.SynthesisInput(text=sentence)
             voice = texttospeech.VoiceSelectionParams(
-                language_code="en-US" if "US" in voice_name else "en-GB",
+                language_code="en-US",
                 name=voice_name,
                 ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
             )
             audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.MP3
+                audio_encoding=texttospeech.AudioEncoding.MP3,
+                speaking_rate=0.8  # SLOWER SPEECH RATE FOR B1 LEVEL
             )
-            response = client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config
-            )
+            response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
             all_audio += response.audio_content
         return all_audio
     except Exception as e:
         print(f"Chirp3 TTS Error: {str(e)}")
-        return generate_tts_standard_sync(text)
+        return None
 
 @retry(
     stop=stop_after_attempt(2),
@@ -187,21 +166,17 @@ def generate_tts_standard_sync(text):
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=0.9,
+            speaking_rate=0.8,  # SLOWER SPEECH RATE FOR B1 LEVEL
         )
-        response = client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
+        response = client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
         return response.audio_content
     except Exception as e:
         print(f"Standard TTS Error: {str(e)}")
         return None
 
-async def generate_tts_async(text, voice_name="en-US-Standard-C"):
+async def generate_tts_async(text, voice_name):
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, generate_tts_standard_sync, text)
+    return await loop.run_in_executor(None, generate_tts_english_sync, text, voice_name)
 
 def safe_filename(filename):
     filename = re.sub(r'[^\w\s.-]', '', filename)
@@ -214,7 +189,7 @@ def validate_deepseek_response(content):
     required_keys = ["main_text", "collocations", "opinion_texts", "discussion_questions"]
     if not all(k in content for k in required_keys):
         missing = [k for k in required_keys if k not in content]
-        raise ValueError(f"Missing required keys in DeepSeek response: {missing}")
+        raise ValueError(f"Missing required keys: {missing}")
     if not isinstance(content['collocations'], list):
         raise ValueError("collocations must be a list")
     if len(content['collocations']) > config.MAX_VOCAB_ITEMS:
@@ -232,74 +207,60 @@ def validate_deepseek_response(content):
     stop=stop_after_attempt(config.API_RETRY_ATTEMPTS),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     retry=retry_if_exception_type((Exception,)),
-    before_sleep=lambda retry_state: print(f"Retry attempt {retry_state.attempt_number} after error: {retry_state.outcome.exception()}")
+    before_sleep=lambda retry_state: print(f"Retry {retry_state.attempt_number}: {retry_state.outcome.exception()}")
 )
 def generate_content_with_deepseek(topic):
-    print(f"[DeepSeek] Generating content for topic: {topic[:50]}...")
     prompt = f"""You are an English language teaching assistant. Create learning materials about the topic: "{topic}"
+
 Please generate a JSON response with the following structure:
 {{
-  "main_text": "An engaging English text at CEFR B1 intermediate (strong) or at most weak B2 level about {topic}. Should be 200-250 words long, natural and informative. MUST contain useful collocations that students should learn.",
+  "main_text": "An engaging English text at CEFR B1 intermediate level about {topic}. Should be 150-200 words long, simple and clear. MUST contain exactly 2 phrasal verbs that are common for B1 level. Include the objects with phrasal verbs (e.g., 'look for a job', 'get up early'). Use simple sentence structures and B1 level vocabulary.",
   "collocations": [
-    {{"english": "useful collocation from text", "russian": "Russian translation"}},
-    // Exactly 15 items total
-    // These should be useful collocations: verb+noun combinations, adjective+noun pairs, phrasal verbs with objects, or other fixed expressions
-    // All collocations must come directly from the main_text
-    // Examples: "make a decision", "highly competitive", "take into account", "work remotely", "face challenges"
+    {{"english": "collocation/phrasal verb with object from text", "russian": "Russian translation"}},
+    // Exactly 12 items total
+    // MUST include the 2 phrasal verbs (with their objects as they appear in the text)
+    // Remaining items should be useful B1 level collocations, expressions, verb+noun, or adjective+noun pairs from the text
+    // All collocations must come directly from the main_text and be appropriate for B1 level
   ],
   "opinion_texts": {{
-    "positive": "A natural English response (B1 intermediate/at most weak B2 level, 80-120 words) giving a positive reaction to the main topic. Should incorporate some vocabulary from the collocations list naturally.",
-    "negative": "A natural English response (B1 intermediate/at most weak B2 level, 80-120 words) giving a critical/negative reaction to the main topic. Should incorporate some vocabulary from the collocations list naturally.",
-    "mixed": "A natural English response (B1 intermediate/at most weak B2 level, 80-120 words) giving a balanced/mixed reaction to the main topic. Should incorporate some vocabulary from the collocations list naturally."
+    "positive": "A simple English response (B1 level, 60-80 words) giving a positive reaction to the main topic. Should use basic vocabulary and simple sentences.",
+    "negative": "A simple English response (B1 level, 60-80 words) giving a critical/negative reaction to the main topic. Should use basic vocabulary and simple sentences.",
+    "mixed": "A simple English response (B1 level, 60-80 words) giving a balanced/mixed reaction to the main topic. Should use basic vocabulary and simple sentences."
   }},
   "discussion_questions": [
-    "Question 1 in English (B1 intermediate/at most weak B2 level) - should encourage critical thinking",
-    "Question 2 in English (B1 intermediate/at most weak B2 level) - should encourage personal reflection",
-    "Question 3 in English (B1 intermediate/at most weak B2 level) - should prompt discussion",
-    "Question 4 in English (B1 intermediate/at most weak B2 level) - should be open-ended",
-    "Question 5 in English (B1 intermediate/at most weak B2 level) - should stimulate debate"
+    "Simple Question 1 in English (B1 level) - easy to understand",
+    "Simple Question 2 in English (B1 level) - about personal experience",
+    "Simple Question 3 in English (B1 level) - about opinions",
+    "Simple Question 4 in English (B1 level) - practical question",
+    "Simple Question 5 in English (B1 level) - future plans"
   ]
 }}
-CRITICAL REQUIREMENTS:
-1. All texts MUST be at CEFR B1 intermediate (strong) or at most weak B2 level
-2. ALL collocations must come from the main_text
-3. Focus on USEFUL collocations of all types (verb+noun, adjective+noun, phrasal verbs with objects, fixed expressions)
-4. Examples of good collocations: "achieve goals", "face consequences", "highly effective", "carry out research", "take advantage of"
-5. Opinion texts should naturally use some collocations but sound conversational
-6. Discussion questions should be thought-provoking, not just comprehension checks
+
+CRITICAL REQUIREMENTS FOR B1 LEVEL:
+1. Main text MUST contain exactly 2 common phrasal verbs with their objects
+2. ALL collocations must come from the main_text and be B1 appropriate
+3. The first 2 collocations MUST be the phrasal verbs
+4. Use simple vocabulary and sentence structures throughout
+5. Opinion texts should use basic B1 level language
+6. Discussion questions should be simple and easy to understand
 7. Return ONLY valid JSON, no additional text"""
 
-    try:
-        print(f"[DeepSeek] Sending request to API...")
-        response = deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "You are an expert English language teacher who creates engaging, natural content at CEFR B1 intermediate (strong) or at most weak B2 level with a focus on useful collocations. Always respond with valid JSON only."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            timeout=45.0
-        )
-        print(f"[DeepSeek] Received response, parsing...")
-        content_text = response.choices[0].message.content
-        json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
-        if json_match:
-            content_text = json_match.group()
-        content = json.loads(content_text)
-        print(f"[DeepSeek] JSON parsed successfully")
-        validate_deepseek_response(content)
-        print(f"[DeepSeek] Validation passed, returning content")
-        return content
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON parsing error: {str(e)}")
-        print(f"[ERROR] Raw content: {content_text[:200]}...")
-        raise
-    except ValueError as e:
-        print(f"[ERROR] Validation error: {str(e)}")
-        raise
-    except Exception as e:
-        print(f"[ERROR] DeepSeek API Error: {type(e).__name__}: {str(e)}")
-        raise
+    response = deepseek_client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "You are an expert English language teacher who creates simple, clear content at CEFR B1 intermediate level with a focus on basic phrasal verbs and useful collocations. Always respond with valid JSON only."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7,
+        timeout=45.0
+    )
+    content_text = response.choices[0].message.content
+    json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
+    if json_match:
+        content_text = json_match.group()
+    content = json.loads(content_text)
+    validate_deepseek_response(content)
+    return content
 
 async def create_vocabulary_file_with_tts(collocations, topic, progress_callback=None):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -313,20 +274,36 @@ async def create_vocabulary_file_with_tts(collocations, topic, progress_callback
         tts_tasks.append(generate_tts_async(item['english'], voice_name="en-US-Standard-C"))
     audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
     for idx, (item, audio_data) in enumerate(zip(collocations, audio_results)):
-        english_text = item['english']
         if progress_callback:
             await progress_callback(idx + 1, total_items)
         if isinstance(audio_data, Exception) or not audio_data:
-            print(f"TTS failed for '{english_text}': {audio_data if isinstance(audio_data, Exception) else 'No data'}")
             content += f"{item['russian']}\t{item['english']}\n"
         else:
-            hash_object = hashlib.md5(english_text.encode())
+            hash_object = hashlib.md5(item['english'].encode())
             audio_filename = f"tts_{hash_object.hexdigest()}.mp3"
             audio_filename = safe_filename(audio_filename)
             audio_files[audio_filename] = audio_data
             anki_tag = f"[sound:{audio_filename}]"
             content += f"{item['russian']}\t{item['english']}\t{anki_tag}\n"
     return filename, content, audio_files
+
+def create_zip_package(vocab_filename, vocab_content, audio_files, html_filename, html_content, topic, timestamp):
+    safe_topic_name = safe_filename(topic)
+    zip_filename = f"{safe_topic_name}_{timestamp}_complete_package.zip"
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        safe_vocab = safe_filename(vocab_filename)
+        zip_file.writestr(safe_vocab, vocab_content.encode('utf-8'))
+        for audio_filename, audio_data in audio_files.items():
+            safe_audio = safe_filename(audio_filename)
+            zip_file.writestr(safe_audio, audio_data)
+        safe_html = safe_filename(html_filename)
+        zip_file.writestr(safe_html, html_content.encode('utf-8'))
+    zip_buffer.seek(0)
+    file_size = zip_buffer.getbuffer().nbytes
+    if file_size > config.MAX_FILE_SIZE:
+        raise ValueError(f"ZIP too large: {file_size / 1024 / 1024:.1f}MB")
+    return zip_filename, zip_buffer
 
 def create_html_document(topic, content, timestamp):
     safe_topic = safe_filename(topic)
@@ -547,14 +524,15 @@ def create_html_document(topic, content, timestamp):
         <div class="header">
             <h1>🎓 English Learning Materials</h1>
             <div class="subtitle">Topic: {topic}</div>
-            <div class="subtitle">Level: CEFR B1 / Weak B2</div>
+            <div class="subtitle">Level: CEFR B1 Intermediate</div>
             <div class="subtitle">Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
         </div>
         <div class="content">
+            <!-- Collocations -->
             <div class="section">
                 <h2 class="section-title">
                     <span class="section-icon">📚</span>
-                    Please learn and activate these useful phrases you will find in today's texts
+                    Collocations & Phrasal Verbs
                 </h2>
                 <table>
                     <thead>
@@ -569,6 +547,7 @@ def create_html_document(topic, content, timestamp):
                     </tbody>
                 </table>
             </div>
+            <!-- Main Text -->
             <div class="section">
                 <h2 class="section-title">
                     <span class="section-icon">📖</span>
@@ -576,9 +555,10 @@ def create_html_document(topic, content, timestamp):
                 </h2>
                 <div class="main-text">{content['main_text']}</div>
             </div>
+            <!-- Opinion Texts -->
             <div class="section">
                 <h2 class="section-title">
-                    <span class="section-icon">💬</span>
+                    <span class="section-icon">💭</span>
                     Different Reactions
                 </h2>
                 <div class="opinion-card opinion-positive">
@@ -597,12 +577,13 @@ def create_html_document(topic, content, timestamp):
                 </div>
                 <div class="opinion-card opinion-mixed">
                     <div class="opinion-header">
-                        <span>⚠️</span>
+                        <span>⚖️</span>
                         <span>Balanced Reaction</span>
                     </div>
                     <div class="opinion-text">{content['opinion_texts']['mixed']}</div>
                 </div>
             </div>
+            <!-- Discussion Questions -->
             <div class="section">
                 <h2 class="section-title">
                     <span class="section-icon">💬</span>
@@ -613,157 +594,222 @@ def create_html_document(topic, content, timestamp):
         </div>
         <div class="footer">
             <p>Generated by English Learning Bot 🤖</p>
-            <p>CEFR B1 / Weak B2 Level Materials</p>
+            <p>CEFR B1 Intermediate Level Materials</p>
         </div>
     </div>
 </body>
 </html>"""
     return html_filename, html_content
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Welcome to the English Learning Bot! 🎓\n"
-        "Simply send me a topic and I'll create comprehensive learning materials:\n"
-        "📄 Reading text (CEFR B1/weak B2 level, 200-250 words)\n"
-        "🔖 15 useful collocations with TTS audio\n"
-        "🗣️ 3 reaction texts (positive, critical, balanced)\n"
-        "💬 5 discussion questions\n"
-        "📦 Complete package: HTML document + Anki files\n"
-        "**Rate Limit:** 5 requests per hour\n"
-        "Just type your topic to begin!\n"
-        "Example: 'remote work', 'climate change', 'social media impact'"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    reset_time = rate_limiter.get_reset_time(user_id)
-    help_text = (
-        "📖 **How to Use:**\n"
-        "1. Send me any topic (max 100 characters)\n"
-        "2. Wait 30-60 seconds for generation\n"
-        "3. Receive comprehensive materials:\n"
-        "   • Beautiful HTML document\n"
-        "   • Collocations file with TTS tags\n"
-        "   • Complete ZIP package\n"
-        "📦 **For Anki Import:**\n"
-        "1. Download the ZIP file\n"
-        "2. Extract MP3 files to your Anki collection.media folder\n"
-        "3. Import the .txt file into Anki\n"
-        "4. Format: Russian | English | [sound:file.mp3]\n"
-        "⚡ **Rate Limit:** 5 requests per hour\n"
-    )
-    if reset_time > 0:
-        help_text += f"⏳ Your limit resets in {reset_time // 60} minutes\n"
-    help_text += (
-        "💡 **Example Topics:**\n"
-        "• remote work challenges\n"
-        "• work-life balance\n"
-        "• environmental protection\n"
-        "• modern technology impact\n"
-        "• urban lifestyle stress"
-    )
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+CHIRP_VOICES = [
+    "en-US-Chirp3-HD-Achird",
+    "en-US-Chirp3-HD-Callirrhoe",
+    "en-US-Chirp3-HD-Achernar",
+    "en-US-Chirp3-HD-Algenib",
+    "en-US-Chirp3-HD-Erinome",
+    "en-US-Chirp3-HD-Schedar",
+    "en-US-Chirp3-HD-Kore"
+]
 
 async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     topic_raw = update.message.text.strip()
+    
     if not rate_limiter.is_allowed(user_id):
         reset_time = rate_limiter.get_reset_time(user_id)
         await update.message.reply_text(
-            f"⏳ Rate limit reached!\n"
+            f"⏱️ Rate limit reached!\n\n"
             f"You've used your 5 requests for this hour.\n"
-            f"Please try again in {reset_time // 60} minutes.\n"
-            f"This helps manage API costs. Thank you for understanding! 🙏"
+            f"Please try again in {reset_time // 60} minutes."
         )
         return
+    
     try:
         topic = validate_topic(topic_raw)
     except ValueError as e:
-        await update.message.reply_text(f"❌ Invalid topic: {str(e)}\nPlease try a different topic.")
+        await update.message.reply_text(f"❌ Invalid topic: {str(e)}\n\nPlease try a different topic.")
         return
 
     await update.message.chat.send_action(action="typing")
     progress_msg = await update.message.reply_text(
-        f"📚 Creating materials about '{topic}'...\n"
+        f"📚 Materials for your '{topic[:20]}...'...\n\n"
         f"⏳ Progress: 0/5\n"
-        f"⚪⚪⚪⚪⚪\n"
+        f"⬜⬜⬜⬜⬜\n"
         f"Initializing..."
     )
-
+    
     async def update_progress(step, message):
-        progress_bar = "🟩" * step + "⚪" * (5 - step)
+        progress_bar = "🟩" * step + "⬜" * (5 - step)
         try:
             await progress_msg.edit_text(
-                f"📚 Creating materials about '{topic}'...\n"
+                f"📚 Materials for your '{topic[:20]}...'...\n\n"
                 f"⏳ Progress: {step}/5\n"
                 f"{progress_bar}\n"
                 f"{message}"
             )
         except:
             pass
-
+    
     try:
         await update_progress(1, "🤖 Generating content with AI...")
         await update.message.chat.send_action(action="typing")
-        print(f"[Bot] Starting content generation for user {user_id}, topic: {topic[:50]}")
         content = generate_content_with_deepseek(topic)
+        if not content:
+            await update.message.reply_text("❌ Failed to generate content. Please try again.")
+            return
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_topic = safe_filename(topic)
-
+        
+        # === Create HTML document ===
         await update_progress(2, "📄 Creating HTML document...")
         html_filename, html_content = create_html_document(topic, content, timestamp)
+        
+        # === Generate TTS for main text and opinion texts using Chirp3 HD voices ===
+        await update_progress(3, "🎧 Generating narration audio...")
+        await update.message.chat.send_action(action="record_voice")
+
+        CHIRP_VOICES = [
+            "en-US-Chirp3-HD-Achird",
+            "en-US-Chirp3-HD-Callirrhoe",
+            "en-US-Chirp3-HD-Achernar",
+            "en-US-Chirp3-HD-Algenib",
+            "en-US-Chirp3-HD-Erinome",
+            "en-US-Chirp3-HD-Schedar",
+            "en-US-Chirp3-HD-Kore"
+        ]
+
+        text_mapping = {
+            "Main_Text.mp3": content['main_text'],
+            "Positive_Reaction.mp3": content['opinion_texts']['positive'],
+            "Critical_Reaction.mp3": content['opinion_texts']['negative'],
+            "Balanced_Reaction.mp3": content['opinion_texts']['mixed']
+        }
+
+        selected_voices = random.sample(CHIRP_VOICES, 4)
+        audio_tasks = []
+        for i, (filename, text) in enumerate(text_mapping.items()):
+            voice = selected_voices[i]
+            audio_tasks.append(generate_tts_async(text, voice))
+
+        audio_results = await asyncio.gather(*audio_tasks, return_exceptions=True)
+        narration_files = []
+        for i, (filename, _) in enumerate(text_mapping.items()):
+            audio_data = audio_results[i]
+            if not isinstance(audio_data, Exception) and audio_data:
+                audio_buffer = BytesIO(audio_data)
+                audio_buffer.name = filename
+                narration_files.append((filename, audio_buffer))
+            else:
+                print(f"TTS failed for {filename}: {audio_data}")
+
+        # === Generate Anki vocabulary file (with Standard-C voice) ===
+        async def vocab_progress(current, total):
+            if current % 3 == 0:
+                await update_progress(4, f"🎵 Generating TTS for collocations... ({current}/{total})")
+
+        vocab_filename, vocab_content, audio_files = await create_vocabulary_file_with_tts(
+            content['collocations'], safe_topic, progress_callback=vocab_progress
+        )
+
+        # === Create ZIP package (for Anki media folder) ===
+        await update_progress(5, "📦 Creating ZIP package...")
+        zip_filename, zip_buffer = create_zip_package(
+            vocab_filename, vocab_content, audio_files, html_filename, html_content, topic, timestamp
+        )
+
+        # === 1. Send HTML document first ===
         html_file = BytesIO(html_content.encode('utf-8'))
         html_file.name = html_filename
         await update.message.reply_document(
             document=html_file,
             filename=html_filename,
-            caption="📄 Learning materials document"
+            caption="📄 Open this doc to see your topic texts and vocab list"
         )
 
-        await update_progress(3, "🎵 Generating TTS audio for collocations...")
-        await update.message.chat.send_action(action="record_voice")
-        async def vocab_progress(current, total):
-            if current % 3 == 0:
-                await update_progress(3, f"🎵 Generating TTS audio... ({current}/{total})")
-        vocab_filename, vocab_content, audio_files = await create_vocabulary_file_with_tts(
-            content['collocations'], 
-            safe_topic,
-            progress_callback=vocab_progress
+        # === 2. Instructional message ===
+        await update.message.reply_text(
+            "👆 You can listen to the texts from the doc by playing the audio below 👇"
         )
 
-        if not audio_files:
-            await update.message.reply_text("⚠️ Warning: Could not generate TTS audio for collocations.")
+        # === 3. Send narration audio files ===
+        if narration_files:
+            for filename, audio_buffer in narration_files:
+                await update.message.reply_audio(audio=audio_buffer, filename=filename)
+        else:
+            await update.message.reply_text("⚠️ Could not generate narration audio.")
 
-        await update_progress(4, "📦 Creating complete package...")
-        zip_filename = f"{safe_topic}_{timestamp}_complete_package.zip"
-        zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            safe_vocab_filename = safe_filename(vocab_filename)
-            zip_file.writestr(safe_vocab_filename, vocab_content.encode('utf-8'))
-            for audio_filename, audio_data in audio_files.items():
-                safe_audio = safe_filename(audio_filename)
-                zip_file.writestr(safe_audio, audio_data)
-            safe_html = safe_filename(html_filename)
-            zip_file.writestr(safe_html, html_content.encode('utf-8'))
-        zip_buffer.seek(0)
+        # === 4. Emoji gap ===
+        await update.message.reply_text("••• 💭 •••")
 
-        file_size = zip_buffer.getbuffer().nbytes
-        if file_size > config.MAX_FILE_SIZE:
-            raise ValueError(f"ZIP file too large: {file_size / 1024 / 1024:.1f}MB (max: {config.MAX_FILE_SIZE / 1024 / 1024}MB)")
+        # === 5. Anki instructions ===
+        await update.message.reply_text(
+            "📇 If you're an Anki user, import the text doc below into Anki, "
+            "and put the audio files from the ZIP folder into your Anki `collection.media` folder."
+        )
 
-        await update_progress(5, "📤 Sending complete package...")
+        # === 6. Send Anki .txt file ===
+        anki_file = BytesIO(vocab_content.encode('utf-8'))
+        anki_file.name = "anki_import.txt"
+        await update.message.reply_document(
+            document=anki_file,
+            filename="anki_import.txt"
+        )
+
+        # === 7. Send ZIP package ===
         zip_file_obj = BytesIO(zip_buffer.getvalue())
         zip_file_obj.name = zip_filename
         await update.message.reply_document(
             document=zip_file_obj,
-            filename=zip_filename,
-            caption="📦 If you use Anki, open this and import files to Anki / Anki folder"
+            filename=zip_filename
         )
-
+        
     except Exception as e:
         error_msg = f"❌ Unexpected error: {str(e)[:200]}"
-        print(f"[Bot] Full error for user {user_id}: {e}")
+        print(f"[Bot] Full error: {e}")
         await update.message.reply_text(error_msg)
+        
+    
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        """Welcome to the English Learning Bot! 🎯
+
+Please give me a topic you want to discuss:
+
+Be specific e.g.:
+
+NOT - How can we use AI in business ( = too general)
+
+GOOD = How can non-coders working in an IT company use AI?
+
+Some examples of topics:
+- "How has X been changing"
+- "What is happening in late 2025 with ..."
+- "Is X better than Y"
+- "Predictions for X in 2026"
+- "How to ..."
+- "Why do people...?"
+"""
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    reset_time = rate_limiter.get_reset_time(user_id)
+    help_text = (
+        "📖 **How to Use:**\n\n"
+        "1. Send me a topic (max 100 chars)\n"
+        "2. Receive:\n"
+        "   • HTML document\n"
+        "   • ZIP package\n"
+        "   • Separate Anki .txt file\n"
+        "   • 4 audio files (Main + 3 reactions)\n"
+        "   • Each with unique Chirp3 HD voice\n\n"
+        "⚡ **Rate Limit:** 5 requests/hour"
+    )
+    if reset_time > 0:
+        help_text += f"\n⏱️ Resets in {reset_time // 60} min"
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 if __name__ == "__main__":
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
